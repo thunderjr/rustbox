@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustbox-core",
+    "crates/rustbox-vm",
+    "crates/rustbox-network",
+    "crates/rustbox-storage",
+    "crates/rustbox-daemon",
+    "crates/rustbox-sdk",
+    "crates/rustbox-cli",
+    "crates/rustbox-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+hyper = { version = "1" }
+hyper-util = { version = "0.1" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# IDs
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Networking
+ipnet = { version = "2", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Concurrency
+dashmap = "6"
+
+# Compression
+zstd = "0.13"
+tar = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# TLS
+rustls = "0.23"
+rcgen = "0.13"
+
+# Linux syscalls
+nix = { version = "0.29", features = ["mount", "sched", "socket", "net", "ioctl", "process", "signal"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Async trait
+async-trait = "0.1"
+
+# Workspace crates
+rustbox-core = { path = "crates/rustbox-core" }
+rustbox-vm = { path = "crates/rustbox-vm" }
+rustbox-network = { path = "crates/rustbox-network" }
+rustbox-storage = { path = "crates/rustbox-storage" }
+rustbox-daemon = { path = "crates/rustbox-daemon" }
+rustbox-sdk = { path = "crates/rustbox-sdk" }
+rustbox-cli = { path = "crates/rustbox-cli" }
+rustbox-agent = { path = "crates/rustbox-agent" }
