@@ -12,11 +12,29 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/snapshots", post(create_snapshot))
+        .route("/snapshots", post(create_snapshot).get(list_snapshots))
         .route(
             "/snapshots/{id}",
             get(get_snapshot).delete(delete_snapshot),
         )
+}
+
+async fn list_snapshots(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SnapshotResponse>>, ApiError> {
+    let snapshots = state.list_snapshots().await?;
+    Ok(Json(
+        snapshots
+            .into_iter()
+            .map(|m| SnapshotResponse {
+                id: m.id,
+                sandbox_id: m.sandbox_id,
+                created_at: m.created_at,
+                size_bytes: m.size_bytes,
+                description: m.description,
+            })
+            .collect(),
+    ))
 }
 
 async fn create_snapshot(

@@ -61,6 +61,14 @@ pub struct ExecResponse {
 pub struct CommandResponse {
     pub command_id: String,
     pub status: CommandStatus,
+    pub output: Vec<CommandOutputEntry>,
+}
+
+#[derive(Serialize)]
+pub struct CommandOutputEntry {
+    pub stream: String,
+    pub data: Option<Vec<u8>>,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Deserialize)]

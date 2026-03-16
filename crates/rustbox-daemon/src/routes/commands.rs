@@ -52,10 +52,31 @@ async fn get_command(
     State(state): State<Arc<AppState>>,
     Path((_sandbox_id, cmd_id)): Path<(String, String)>,
 ) -> Result<Json<CommandResponse>, ApiError> {
-    let (_sid, status, _log) = state.get_command(&cmd_id).await?;
+    let (_sid, status, log) = state.get_command(&cmd_id).await?;
+    let output = log
+        .into_iter()
+        .map(|o| match o {
+            rustbox_core::CommandOutput::Stdout(data) => CommandOutputEntry {
+                stream: "stdout".into(),
+                data: Some(data),
+                exit_code: None,
+            },
+            rustbox_core::CommandOutput::Stderr(data) => CommandOutputEntry {
+                stream: "stderr".into(),
+                data: Some(data),
+                exit_code: None,
+            },
+            rustbox_core::CommandOutput::Exit(code) => CommandOutputEntry {
+                stream: "exit".into(),
+                data: None,
+                exit_code: Some(code),
+            },
+        })
+        .collect();
     Ok(Json(CommandResponse {
         command_id: cmd_id,
         status,
+        output,
     }))
 }
 

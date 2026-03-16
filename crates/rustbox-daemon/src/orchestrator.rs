@@ -140,6 +140,7 @@ impl Orchestrator {
         let commands = Arc::clone(&self.commands);
         let cid = cmd_id_str.clone();
         tokio::spawn(async move {
+            let mut got_exit = false;
             while let Some(output) = rx.recv().await {
                 let is_exit = matches!(&output, CommandOutput::Exit(_));
                 // Store in log and broadcast
@@ -150,8 +151,16 @@ impl Orchestrator {
                         if let Some(CommandOutput::Exit(code)) = entry.output_log.last() {
                             entry.status = CommandStatus::Completed(*code);
                         }
+                        got_exit = true;
                         break;
                     }
+                }
+            }
+            // Channel closed without an Exit message — agent disconnected.
+            if !got_exit {
+                if let Some(mut entry) = commands.get_mut(&cid) {
+                    entry.status =
+                        CommandStatus::Failed("agent connection lost".to_string());
                 }
             }
         });
@@ -227,6 +236,12 @@ impl Orchestrator {
             .map_err(|e| RustboxError::Storage(e.to_string()))?;
 
         Ok(metadata)
+    }
+
+    pub async fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
+        self.snapshot_store
+            .list_all()
+            .map_err(|e| RustboxError::Storage(e.to_string()))
     }
 
     pub async fn get_snapshot(&self, id: &str) -> Result<SnapshotMetadata> {
