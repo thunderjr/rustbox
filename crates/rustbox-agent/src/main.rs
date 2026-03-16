@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     // TODO(phase2): Replace TCP with vsock listener:
     //   let listener = VsockListener::bind(VSOCK_CID, AGENT_PORT)?;
-    let addr = format!("127.0.0.1:{AGENT_PORT}");
+    let addr = format!("0.0.0.0:{AGENT_PORT}");
     let listener = TcpListener::bind(&addr).await?;
     info!(addr = %addr, "agent listening");
 
