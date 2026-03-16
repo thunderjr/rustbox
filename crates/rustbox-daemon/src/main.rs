@@ -1,7 +1,7 @@
 use rustbox_daemon::build_router;
 use rustbox_daemon::orchestrator::Orchestrator;
 use rustbox_storage::SnapshotStore;
-use rustbox_vm::mock_backend::MockBackend;
+use rustbox_vm::backend::VmBackend;
 use std::sync::Arc;
 
 #[tokio::main]
@@ -10,7 +10,40 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let backend = Arc::new(MockBackend::new());
+    let backend: Arc<dyn VmBackend> = match std::env::var("RUSTBOX_BACKEND").as_deref() {
+        Ok("local") => {
+            tracing::info!("using LocalBackend (no isolation)");
+            Arc::new(rustbox_vm::local_backend::LocalBackend::new())
+        }
+        _ => {
+            #[cfg(target_os = "macos")]
+            {
+                use rustbox_vm::lima::backend::LimaFirecrackerBackend;
+                use rustbox_vm::lima::manager::LimaConfig;
+                tracing::info!("using LimaFirecrackerBackend (macOS)");
+                let config = LimaConfig::default();
+                Arc::new(
+                    LimaFirecrackerBackend::new(config)
+                        .await
+                        .expect("failed to initialize Lima+Firecracker backend"),
+                )
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use rustbox_vm::firecracker::backend::{FirecrackerBackend, FirecrackerBackendConfig};
+                tracing::info!("using FirecrackerBackend (Linux)");
+                let config = FirecrackerBackendConfig {
+                    firecracker_bin: std::path::PathBuf::from("firecracker"),
+                    kernel_path: std::path::PathBuf::from("/opt/rustbox/images/vmlinux"),
+                    rootfs_dir: std::path::PathBuf::from("/opt/rustbox/images"),
+                    state_dir: std::path::PathBuf::from("/var/lib/rustbox/state"),
+                    vsock_base_dir: std::path::PathBuf::from("/var/lib/rustbox/vsock"),
+                };
+                Arc::new(FirecrackerBackend::new(config))
+            }
+        }
+    };
+
     let snapshot_store = SnapshotStore::new("rustbox.db").expect("failed to open snapshot store");
     let orchestrator = Arc::new(Orchestrator::new(backend, snapshot_store));
 
