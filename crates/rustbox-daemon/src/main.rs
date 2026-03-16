@@ -15,32 +15,28 @@ async fn main() {
             tracing::info!("using LocalBackend (no isolation)");
             Arc::new(rustbox_vm::local_backend::LocalBackend::new())
         }
+        #[cfg(target_os = "linux")]
+        Ok("firecracker") => {
+            use rustbox_vm::firecracker::backend::{FirecrackerBackend, FirecrackerBackendConfig};
+            tracing::info!("using FirecrackerBackend (Linux)");
+            let config = FirecrackerBackendConfig {
+                firecracker_bin: std::path::PathBuf::from("firecracker"),
+                kernel_path: std::path::PathBuf::from("/opt/rustbox/images/vmlinux"),
+                rootfs_dir: std::path::PathBuf::from("/opt/rustbox/images"),
+                state_dir: std::path::PathBuf::from("/var/lib/rustbox/state"),
+                vsock_base_dir: std::path::PathBuf::from("/var/lib/rustbox/vsock"),
+            };
+            Arc::new(FirecrackerBackend::new(config))
+        }
         _ => {
-            #[cfg(target_os = "macos")]
-            {
-                use rustbox_vm::lima::backend::LimaFirecrackerBackend;
-                use rustbox_vm::lima::manager::LimaConfig;
-                tracing::info!("using LimaFirecrackerBackend (macOS)");
-                let config = LimaConfig::default();
-                Arc::new(
-                    LimaFirecrackerBackend::new(config)
-                        .await
-                        .expect("failed to initialize Lima+Firecracker backend"),
-                )
-            }
-            #[cfg(target_os = "linux")]
-            {
-                use rustbox_vm::firecracker::backend::{FirecrackerBackend, FirecrackerBackendConfig};
-                tracing::info!("using FirecrackerBackend (Linux)");
-                let config = FirecrackerBackendConfig {
-                    firecracker_bin: std::path::PathBuf::from("firecracker"),
-                    kernel_path: std::path::PathBuf::from("/opt/rustbox/images/vmlinux"),
-                    rootfs_dir: std::path::PathBuf::from("/opt/rustbox/images"),
-                    state_dir: std::path::PathBuf::from("/var/lib/rustbox/state"),
-                    vsock_base_dir: std::path::PathBuf::from("/var/lib/rustbox/vsock"),
-                };
-                Arc::new(FirecrackerBackend::new(config))
-            }
+            use rustbox_vm::docker::backend::{DockerBackend, DockerBackendConfig};
+            tracing::info!("using DockerBackend");
+            let config = DockerBackendConfig::default();
+            Arc::new(
+                DockerBackend::new(config)
+                    .await
+                    .expect("failed to initialize Docker backend"),
+            )
         }
     };
 
