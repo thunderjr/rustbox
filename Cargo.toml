@@ -73,6 +73,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # Async trait
 async-trait = "0.1"
 
+# Docker
+bollard = "0.18"
+
 # Workspace crates
 rustbox-core = { path = "crates/rustbox-core" }
 rustbox-vm = { path = "crates/rustbox-vm" }

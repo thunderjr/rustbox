@@ -18,3 +18,5 @@ async-trait = { workspace = true }
 nix = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
+bollard = { workspace = true }
+tokio-stream = { workspace = true }
