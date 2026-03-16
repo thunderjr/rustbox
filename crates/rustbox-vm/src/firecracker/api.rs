@@ -2,32 +2,67 @@ use std::path::{Path, PathBuf};
 
 use rustbox_core::{Result, RustboxError};
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
 use tracing::{debug, warn};
 
-/// Client for the Firecracker REST API over a Unix domain socket.
+/// Transport type for connecting to the Firecracker API.
+pub enum FirecrackerTransport {
+    /// Connect via Unix domain socket (used on Linux with local Firecracker).
+    Unix(PathBuf),
+    /// Connect via TCP (used when forwarding through Lima SSH tunnel).
+    Tcp(String, u16),
+}
+
+/// Client for the Firecracker REST API over a Unix domain socket or TCP connection.
 pub struct FirecrackerClient {
-    socket_path: PathBuf,
+    transport: FirecrackerTransport,
 }
 
 impl FirecrackerClient {
     pub fn new(socket_path: &Path) -> Self {
         Self {
-            socket_path: socket_path.to_path_buf(),
+            transport: FirecrackerTransport::Unix(socket_path.to_path_buf()),
         }
     }
 
-    /// Send a raw HTTP/1.1 request over the Unix socket and return (status_code, body).
+    pub fn new_tcp(host: &str, port: u16) -> Self {
+        Self {
+            transport: FirecrackerTransport::Tcp(host.to_string(), port),
+        }
+    }
+
+    /// Send a raw HTTP/1.1 request and return (status_code, body).
     async fn request(
         &self,
         method: &str,
         path: &str,
         body: Option<&str>,
     ) -> Result<(u16, String)> {
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|e| RustboxError::VmBackend(format!("connect to socket: {e}")))?;
+        match &self.transport {
+            FirecrackerTransport::Unix(socket_path) => {
+                let stream = UnixStream::connect(socket_path)
+                    .await
+                    .map_err(|e| RustboxError::VmBackend(format!("connect to socket: {e}")))?;
+                self.do_request(stream, method, path, body).await
+            }
+            FirecrackerTransport::Tcp(host, port) => {
+                let stream = TcpStream::connect(format!("{host}:{port}"))
+                    .await
+                    .map_err(|e| RustboxError::VmBackend(format!("connect to tcp: {e}")))?;
+                self.do_request(stream, method, path, body).await
+            }
+        }
+    }
+
+    /// Execute the HTTP request over any async stream.
+    async fn do_request(
+        &self,
+        mut stream: impl AsyncRead + AsyncWrite + Unpin,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<(u16, String)> {
 
         let body_bytes = body.unwrap_or("");
         let request = if body.is_some() {
@@ -57,28 +92,23 @@ impl FirecrackerClient {
             .await
             .map_err(|e| RustboxError::VmBackend(format!("write request: {e}")))?;
 
-        stream
-            .shutdown()
+        // Read the HTTP response by parsing headers then reading Content-Length
+        // bytes. We avoid shutdown()+read_to_end() because through an SSH tunnel
+        // the half-close can tear down the channel, and without it read_to_end
+        // blocks forever waiting for the remote to close.
+        let mut reader = BufReader::new(stream);
+
+        // Read status line.
+        let mut status_line = String::new();
+        reader
+            .read_line(&mut status_line)
             .await
-            .map_err(|e| RustboxError::VmBackend(format!("shutdown write: {e}")))?;
+            .map_err(|e| RustboxError::VmBackend(format!("read status line: {e}")))?;
+        let status_line = status_line.trim_end();
 
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .await
-            .map_err(|e| RustboxError::VmBackend(format!("read response: {e}")))?;
-
-        let response_str = String::from_utf8_lossy(&response);
-
-        // Parse HTTP response: status line then headers then body
-        let (head, body) = response_str
-            .split_once("\r\n\r\n")
-            .unwrap_or((&response_str, ""));
-
-        let status_line = head
-            .lines()
-            .next()
-            .ok_or_else(|| RustboxError::VmBackend("empty response".to_string()))?;
+        if status_line.is_empty() {
+            return Err(RustboxError::VmBackend("empty response".to_string()));
+        }
 
         // Status line: "HTTP/1.1 200 OK"
         let status_code: u16 = status_line
@@ -88,6 +118,42 @@ impl FirecrackerClient {
             .ok_or_else(|| {
                 RustboxError::VmBackend(format!("invalid status line: {status_line}"))
             })?;
+
+        // Read headers until blank line, extract Content-Length.
+        let mut content_length: usize = 0;
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| RustboxError::VmBackend(format!("read header: {e}")))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+                if let Ok(len) = val.trim().parse::<usize>() {
+                    content_length = len;
+                }
+            }
+            // Also check lowercase (HTTP headers are case-insensitive).
+            if let Some(val) = trimmed.strip_prefix("content-length:") {
+                if let Ok(len) = val.trim().parse::<usize>() {
+                    content_length = len;
+                }
+            }
+        }
+
+        // Read exactly content_length bytes of body.
+        let mut body_buf = vec![0u8; content_length];
+        if content_length > 0 {
+            use tokio::io::AsyncReadExt;
+            reader
+                .read_exact(&mut body_buf)
+                .await
+                .map_err(|e| RustboxError::VmBackend(format!("read body: {e}")))?;
+        }
+        let body = String::from_utf8_lossy(&body_buf).to_string();
 
         debug!(
             method = method,
@@ -107,7 +173,7 @@ impl FirecrackerClient {
             )));
         }
 
-        Ok((status_code, body.to_string()))
+        Ok((status_code, body))
     }
 
     /// Helper for PUT requests with a JSON body.
