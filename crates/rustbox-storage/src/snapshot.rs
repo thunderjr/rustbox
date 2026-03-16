@@ -160,6 +160,46 @@ impl SnapshotStore {
         Ok(results)
     }
 
+    pub fn list_all(&self) -> Result<Vec<SnapshotMetadata>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, sandbox_id, created_at, expires_at, size_bytes, description FROM snapshots ORDER BY created_at DESC",
+            )
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SnapshotMetadata {
+                    id: row.get(0)?,
+                    sandbox_id: row.get(1)?,
+                    created_at: {
+                        let s: String = row.get(2)?;
+                        DateTime::parse_from_rfc3339(&s)
+                            .unwrap()
+                            .with_timezone(&Utc)
+                    },
+                    expires_at: {
+                        let s: Option<String> = row.get(3)?;
+                        s.map(|s| {
+                            DateTime::parse_from_rfc3339(&s)
+                                .unwrap()
+                                .with_timezone(&Utc)
+                        })
+                    },
+                    size_bytes: row.get::<_, i64>(4)? as u64,
+                    description: row.get(5)?,
+                })
+            })
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| StorageError::Database(e.to_string()))?);
+        }
+        Ok(results)
+    }
+
     pub fn delete(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let affected = conn
