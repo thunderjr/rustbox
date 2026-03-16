@@ -28,7 +28,7 @@ struct CreateSandboxBody {
     source: Option<SandboxSource>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct SandboxInfo {
     pub id: String,
     pub status: SandboxStatus,
@@ -43,10 +43,18 @@ struct ExecResponseBody {
     command_id: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
+pub struct CommandOutputEntry {
+    pub stream: String,
+    pub data: Option<Vec<u8>>,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
 pub struct CommandInfo {
     pub command_id: String,
     pub status: CommandStatus,
+    pub output: Vec<CommandOutputEntry>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -56,7 +64,7 @@ struct ReadFileBody {
     content: Vec<u8>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 pub struct SnapshotInfo {
     pub id: String,
     pub sandbox_id: String,
@@ -311,6 +319,46 @@ impl RustboxClient {
             .await?;
         self.check_error(resp).await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exec_full(
+        &self,
+        sandbox_id: &str,
+        cmd: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        env: Option<&HashMap<String, String>>,
+        sudo: bool,
+        detached: bool,
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "cmd": cmd,
+            "args": args,
+            "cwd": cwd,
+            "env": env,
+            "sudo": sudo,
+            "detached": detached,
+        });
+        let resp = self
+            .client
+            .post(self.url(&format!("/sandboxes/{sandbox_id}/commands")))
+            .json(&body)
+            .send()
+            .await?;
+        let resp = self.check_error(resp).await?;
+        let body: ExecResponseBody = resp.json().await?;
+        Ok(body.command_id)
+    }
+
+    pub async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
+        let resp = self
+            .client
+            .get(self.url("/snapshots"))
+            .send()
+            .await?;
+        let resp = self.check_error(resp).await?;
+        Ok(resp.json().await?)
     }
 
     pub async fn get_metrics(&self, sandbox_id: &str) -> Result<SandboxMetrics> {
