@@ -13,7 +13,6 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use rustbox_core::network::NetworkMode;
 use rustbox_core::protocol::{AgentRequest, AgentResponse};
 use rustbox_core::{
     backend::VmBackend, CommandId, CommandOutput, CommandRequest, Result, RustboxError,
@@ -21,6 +20,7 @@ use rustbox_core::{
 };
 
 use super::images::image_for_runtime;
+use super::network;
 use crate::agent_client::AgentClient;
 
 /// Agent port inside the container.
@@ -55,6 +55,9 @@ struct DockerInstance {
     status: SandboxStatus,
     container_id: String,
     agent_host_port: u16,
+    network_name: Option<String>,
+    #[cfg(target_os = "linux")]
+    container_ip: Option<String>,
 }
 
 /// VmBackend implementation backed by Docker containers.
@@ -92,6 +95,7 @@ impl DockerBackend {
         };
 
         backend.cleanup_orphaned_containers().await;
+        network::cleanup_orphaned_networks(&backend.docker).await;
 
         Ok(backend)
     }
@@ -158,6 +162,33 @@ impl DockerBackend {
 
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+    }
+
+    /// Get a container's IP address on a given Docker network.
+    #[cfg(target_os = "linux")]
+    async fn get_container_ip(
+        &self,
+        container_id: &str,
+        network_name: &str,
+    ) -> Result<String> {
+        let info = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| RustboxError::VmBackend(format!("inspect container for IP: {e}")))?;
+
+        info.network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .and_then(|nets| nets.get(network_name))
+            .and_then(|net| net.ip_address.as_ref())
+            .filter(|ip| !ip.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                RustboxError::VmBackend(format!(
+                    "no IP address for container {container_id} on network {network_name}"
+                ))
+            })
     }
 
     /// Inspect a running container to find the host-mapped port for the agent.
@@ -250,15 +281,15 @@ impl VmBackend for DockerBackend {
         port_bindings.insert(
             exposed_port_key,
             Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
+                host_ip: Some("127.0.0.1".to_string()),
                 host_port: Some("0".to_string()), // OS-assigned
             }]),
         );
 
-        let network_mode = match config.network_policy.mode {
-            NetworkMode::DenyAll => Some("none".to_string()),
-            NetworkMode::AllowAll => None, // default bridge
-        };
+        // Create a per-sandbox bridge network so agent port mapping works
+        // even with DenyAll policy. Egress filtering is handled via iptables
+        // on Linux (applied in start()).
+        let net_name = network::create_sandbox_network(&self.docker, id).await?;
 
         let mut labels = HashMap::new();
         labels.insert(MANAGED_LABEL.to_string(), "true".to_string());
@@ -268,7 +299,7 @@ impl VmBackend for DockerBackend {
             nano_cpus: Some(nano_cpus as i64),
             memory: Some(memory),
             port_bindings: Some(port_bindings),
-            network_mode,
+            network_mode: Some(net_name.clone()),
             ..Default::default()
         };
 
@@ -300,6 +331,9 @@ impl VmBackend for DockerBackend {
                 status: SandboxStatus::Pending,
                 container_id: response.id,
                 agent_host_port: 0, // set on start
+                network_name: Some(net_name),
+                #[cfg(target_os = "linux")]
+                container_ip: None,
             },
         );
 
@@ -330,6 +364,23 @@ impl VmBackend for DockerBackend {
         // Wait for the agent to be ready.
         Self::wait_for_agent("127.0.0.1", host_port, 30).await?;
 
+        // Apply iptables rules for network policy enforcement on Linux.
+        #[cfg(target_os = "linux")]
+        {
+            let inst = self
+                .instances
+                .get(&key)
+                .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
+            if let Some(ref net) = inst.network_name {
+                let ip = self.get_container_ip(&container_id, net).await?;
+                network::apply_iptables(&ip, &inst.config.network_policy).await?;
+                drop(inst);
+                if let Some(mut inst) = self.instances.get_mut(&key) {
+                    inst.container_ip = Some(ip);
+                }
+            }
+        }
+
         // Update instance state.
         if let Some(mut inst) = self.instances.get_mut(&key) {
             inst.agent_host_port = host_port;
@@ -342,18 +393,28 @@ impl VmBackend for DockerBackend {
 
     async fn stop(&self, id: &SandboxId, _blocking: bool) -> Result<()> {
         let key = id.to_string();
-        let container_id = {
-            let inst = self
-                .instances
-                .get(&key)
-                .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
-            if inst.status != SandboxStatus::Running {
-                return Err(RustboxError::SandboxNotRunning(key));
-            }
-            inst.container_id.clone()
-        };
+        let inst_ref = self
+            .instances
+            .get(&key)
+            .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
+        if inst_ref.status != SandboxStatus::Running {
+            return Err(RustboxError::SandboxNotRunning(key));
+        }
+        let container_id = inst_ref.container_id.clone();
+        let net_name = inst_ref.network_name.clone();
+        #[cfg(target_os = "linux")]
+        let container_ip = inst_ref.container_ip.clone();
+        drop(inst_ref);
 
         info!(%id, "stopping docker sandbox");
+
+        // Clean up iptables rules before stopping the container.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ref ip) = container_ip {
+                let _ = network::remove_iptables(ip).await;
+            }
+        }
 
         let stop_opts = StopContainerOptions { t: 10 };
         if let Err(e) = self.docker.stop_container(&container_id, Some(stop_opts)).await {
@@ -366,6 +427,11 @@ impl VmBackend for DockerBackend {
         };
         if let Err(e) = self.docker.remove_container(&container_id, Some(remove_opts)).await {
             warn!(%id, error = %e, "failed to remove container");
+        }
+
+        // Remove the per-sandbox network.
+        if net_name.is_some() {
+            let _ = network::remove_sandbox_network(&self.docker, id).await;
         }
 
         if let Some(mut inst) = self.instances.get_mut(&key) {
@@ -565,16 +631,27 @@ impl VmBackend for DockerBackend {
     ) -> Result<()> {
         let key = id.to_string();
 
-        // Get original config and stop current container.
-        let (original_config, old_container_id) = {
-            let inst = self
-                .instances
-                .get(&key)
-                .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
-            (inst.config.clone(), inst.container_id.clone())
-        };
+        // Get original config, stop current container, and clean up old network.
+        let inst_ref = self
+            .instances
+            .get(&key)
+            .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
+        let original_config = inst_ref.config.clone();
+        let old_container_id = inst_ref.container_id.clone();
+        let old_net_name = inst_ref.network_name.clone();
+        #[cfg(target_os = "linux")]
+        let old_ip = inst_ref.container_ip.clone();
+        drop(inst_ref);
 
         info!(%id, snap = %snap, "restoring docker snapshot");
+
+        // Clean up iptables for old container.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ref ip) = old_ip {
+                let _ = network::remove_iptables(ip).await;
+            }
+        }
 
         // Stop and remove old container.
         let stop_opts = StopContainerOptions { t: 5 };
@@ -584,6 +661,12 @@ impl VmBackend for DockerBackend {
             ..Default::default()
         };
         let _ = self.docker.remove_container(&old_container_id, Some(remove_opts)).await;
+
+        // Remove old network and create a fresh one.
+        if old_net_name.is_some() {
+            let _ = network::remove_sandbox_network(&self.docker, id).await;
+        }
+        let net_name = network::create_sandbox_network(&self.docker, id).await?;
 
         // Create new container from snapshot image.
         let snapshot_image = format!("rustbox-snap-{key}:{snap}");
@@ -613,15 +696,10 @@ impl VmBackend for DockerBackend {
         port_bindings.insert(
             exposed_port_key,
             Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
+                host_ip: Some("127.0.0.1".to_string()),
                 host_port: Some("0".to_string()),
             }]),
         );
-
-        let network_mode = match original_config.network_policy.mode {
-            NetworkMode::DenyAll => Some("none".to_string()),
-            NetworkMode::AllowAll => None,
-        };
 
         let mut labels = HashMap::new();
         labels.insert(MANAGED_LABEL.to_string(), "true".to_string());
@@ -631,7 +709,7 @@ impl VmBackend for DockerBackend {
             nano_cpus: Some(nano_cpus as i64),
             memory: Some(memory),
             port_bindings: Some(port_bindings),
-            network_mode,
+            network_mode: Some(net_name.clone()),
             ..Default::default()
         };
 
@@ -666,10 +744,23 @@ impl VmBackend for DockerBackend {
         let host_port = self.get_mapped_port(&new_container_id).await?;
         Self::wait_for_agent("127.0.0.1", host_port, 30).await?;
 
+        // Apply iptables rules on Linux.
+        #[cfg(target_os = "linux")]
+        let container_ip = {
+            let ip = self.get_container_ip(&new_container_id, &net_name).await?;
+            network::apply_iptables(&ip, &original_config.network_policy).await?;
+            Some(ip)
+        };
+
         if let Some(mut inst) = self.instances.get_mut(&key) {
             inst.container_id = new_container_id;
             inst.agent_host_port = host_port;
             inst.status = SandboxStatus::Running;
+            inst.network_name = Some(net_name);
+            #[cfg(target_os = "linux")]
+            {
+                inst.container_ip = container_ip;
+            }
         }
 
         info!(%id, "docker snapshot restored");
