@@ -5,6 +5,10 @@ pub mod credential;
 pub mod policy;
 pub mod firewall;
 pub mod tls_proxy;
+pub mod proxy;
+
+#[cfg(target_os = "linux")]
+pub mod proxy_redirect;
 
 pub use error::NetworkError;
 pub use domain::domain_matches;
@@ -13,3 +17,4 @@ pub use credential::find_credential_headers;
 pub use policy::NetworkPolicyEvaluator;
 pub use firewall::NftablesRuleSet;
 pub use tls_proxy::CertificateAuthority;
+pub use proxy::{TransparentProxy, needs_domain_proxy};
