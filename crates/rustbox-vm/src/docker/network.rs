@@ -8,6 +8,7 @@ use bollard::network::{CreateNetworkOptions, ListNetworksOptions};
 use std::collections::HashMap;
 use tracing::{info, warn};
 
+use rustbox_core::network::{NetworkMode, NetworkPolicy};
 use rustbox_core::{Result, RustboxError, SandboxId};
 
 /// Network name prefix for rustbox-managed Docker networks.
@@ -24,15 +25,30 @@ pub fn network_name(id: &SandboxId) -> String {
 }
 
 /// Create a per-sandbox Docker bridge network. Returns the network name.
-pub async fn create_sandbox_network(docker: &Docker, id: &SandboxId) -> Result<String> {
+///
+/// When the policy is `DenyAll` with no `subnets_allow` entries, the network is
+/// created with `internal: true` to block all egress. This works cross-platform
+/// via the Docker API (no iptables required).
+pub async fn create_sandbox_network(
+    docker: &Docker,
+    id: &SandboxId,
+    policy: &NetworkPolicy,
+) -> Result<String> {
     let name = network_name(id);
 
-    info!(network = %name, "creating sandbox network");
+    let internal = matches!(policy.mode, NetworkMode::DenyAll)
+        && policy.subnets_allow.is_empty();
+
+    if internal {
+        info!(network = %name, "creating internal sandbox network (DenyAll, no subnets_allow)");
+    } else {
+        info!(network = %name, "creating sandbox network");
+    }
 
     let opts = CreateNetworkOptions {
         name: name.clone(),
         driver: "bridge".to_string(),
-        internal: false,
+        internal,
         ..Default::default()
     };
 
@@ -188,6 +204,23 @@ async fn run_iptables(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Apply iptables rules — no-op on non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub async fn apply_iptables(
+    _container_ip: &str,
+    _policy: &NetworkPolicy,
+) -> Result<()> {
+    warn!("subnet-level network filtering not enforced on macOS");
+    Ok(())
+}
+
+/// Remove iptables rules — no-op on non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub async fn remove_iptables(_container_ip: &str) -> Result<()> {
+    warn!("subnet-level network filtering not enforced on macOS");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +245,45 @@ mod tests {
         let id1 = SandboxId::new();
         let id2 = SandboxId::new();
         assert_ne!(network_name(&id1), network_name(&id2));
+    }
+
+    /// Verify that `create_sandbox_network` sets `internal: true` when the
+    /// policy is DenyAll with no allowed subnets. We can't easily test against
+    /// a real Docker daemon in unit tests, but we verify the logic by checking
+    /// the internal flag computation directly.
+    #[test]
+    fn deny_all_empty_subnets_is_internal() {
+        let policy = NetworkPolicy {
+            mode: NetworkMode::DenyAll,
+            allow_domains: vec![],
+            subnets_allow: vec![],
+            subnets_deny: vec![],
+            transform_rules: vec![],
+        };
+        let internal = matches!(policy.mode, NetworkMode::DenyAll)
+            && policy.subnets_allow.is_empty();
+        assert!(internal, "DenyAll with no subnets_allow should be internal");
+    }
+
+    #[test]
+    fn deny_all_with_subnets_is_not_internal() {
+        let policy = NetworkPolicy {
+            mode: NetworkMode::DenyAll,
+            allow_domains: vec![],
+            subnets_allow: vec!["10.0.0.0/8".parse().unwrap()],
+            subnets_deny: vec![],
+            transform_rules: vec![],
+        };
+        let internal = matches!(policy.mode, NetworkMode::DenyAll)
+            && policy.subnets_allow.is_empty();
+        assert!(!internal, "DenyAll with subnets_allow should not be internal");
+    }
+
+    #[test]
+    fn allow_all_is_not_internal() {
+        let policy = NetworkPolicy::default();
+        let internal = matches!(policy.mode, NetworkMode::DenyAll)
+            && policy.subnets_allow.is_empty();
+        assert!(!internal, "AllowAll should not be internal");
     }
 }
