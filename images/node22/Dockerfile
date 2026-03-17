@@ -5,5 +5,7 @@ RUN cargo build --release --bin rustbox-agent
 
 FROM node:22-bookworm-slim
 COPY --from=builder /src/target/release/rustbox-agent /usr/bin/rustbox-agent
+COPY scripts/vm-init.sh /sbin/init
+RUN chmod +x /sbin/init
 EXPOSE 5123
 CMD ["/usr/bin/rustbox-agent"]
