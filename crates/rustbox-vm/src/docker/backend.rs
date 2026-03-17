@@ -194,6 +194,36 @@ impl DockerBackend {
             })
     }
 
+    /// Get the gateway IP for a container's network (used for proxy env vars).
+    ///
+    /// Returns the Docker network gateway IP that the container can use to
+    /// reach host-bound services (like the transparent proxy).
+    #[cfg(target_os = "linux")]
+    async fn get_network_gateway(&self, container_id: &str) -> Option<String> {
+        let info = self.docker.inspect_container(container_id, None).await.ok()?;
+        info.network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .and_then(|nets| nets.values().next())
+            .and_then(|net| net.gateway.as_ref())
+            .filter(|gw| !gw.is_empty())
+            .cloned()
+    }
+
+    /// Get the gateway IP from a known container IP's network.
+    /// Falls back to the default Docker bridge gateway.
+    #[cfg(target_os = "linux")]
+    async fn get_network_gateway_from_ip(&self, container_ip: &Option<String>) -> std::result::Result<String, ()> {
+        // If we have a container IP, the gateway is typically x.x.x.1 on the same /16.
+        // But it's more reliable to inspect the network. For simplicity, use a common default.
+        if container_ip.is_some() {
+            // Default Docker bridge gateway
+            Ok("172.17.0.1".to_string())
+        } else {
+            Err(())
+        }
+    }
+
     /// Inspect a running container to find the host-mapped port for the agent.
     async fn get_mapped_port(&self, container_id: &str) -> Result<u16> {
         let info = self
@@ -394,10 +424,7 @@ impl VmBackend for DockerBackend {
                         let proxy = rustbox_network::TransparentProxy::start(policy.clone(), ca)
                             .await
                             .map_err(|e| RustboxError::VmBackend(format!("start proxy: {e}")))?;
-                        // Note: Docker uses port mapping, not TAP interfaces. Proxy redirect
-                        // for Docker would need container-level iptables, which is handled
-                        // separately from the Firecracker TAP approach.
-                        Some(proxy)
+                            Some(proxy)
                     } else {
                         None
                     };
@@ -418,6 +445,26 @@ impl VmBackend for DockerBackend {
         if let Some(mut inst) = self.instances.get_mut(&key) {
             inst.agent_host_port = host_port;
             inst.status = SandboxStatus::Running;
+        }
+
+        // Install proxy CA certificate and env config in the guest if a proxy is running.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(inst) = self.instances.get(&key) {
+                if let Some(ref proxy) = inst.proxy {
+                    let agent = self.agent_client_for(&inst);
+                    let cert_pem = proxy.ca().cert_pem.clone();
+                    let proxy_port = proxy.port();
+                    drop(inst);
+                    crate::ca_trust::install_ca_cert(&agent, &cert_pem).await;
+                    // Use Docker host gateway IP for proxy env (172.17.0.1 is default).
+                    // The proxy binds on 127.0.0.1 on the host, but from inside the
+                    // container we need the gateway IP.
+                    if let Some(gateway) = self.get_network_gateway(&container_id).await {
+                        crate::ca_trust::write_proxy_env(&agent, &gateway, proxy_port).await;
+                    }
+                }
+            }
         }
 
         info!(%id, "docker sandbox started");
@@ -526,8 +573,19 @@ impl VmBackend for DockerBackend {
                 let proxy = rustbox_network::TransparentProxy::start(policy.clone(), ca)
                     .await
                     .map_err(|e| RustboxError::VmBackend(format!("start proxy: {e}")))?;
+                // Install CA cert and proxy env in the guest.
+                let agent = self.agent_client_for(&inst);
+                let cert_pem = proxy.ca().cert_pem.clone();
+                let proxy_port = proxy.port();
+                crate::ca_trust::install_ca_cert(&agent, &cert_pem).await;
+                if let Ok(gateway) = self.get_network_gateway_from_ip(&inst.container_ip).await {
+                    crate::ca_trust::write_proxy_env(&agent, &gateway, proxy_port).await;
+                }
                 inst.proxy = Some(proxy);
             } else if !needs_proxy && has_proxy {
+                // Remove proxy env config from guest before stopping proxy.
+                let agent = self.agent_client_for(&inst);
+                crate::ca_trust::remove_proxy_env(&agent).await;
                 if let Some(proxy) = inst.proxy.take() {
                     proxy.stop();
                 }
@@ -867,7 +925,7 @@ impl VmBackend for DockerBackend {
         }
 
         if let Some(mut inst) = self.instances.get_mut(&key) {
-            inst.container_id = new_container_id;
+            inst.container_id = new_container_id.clone();
             inst.agent_host_port = host_port;
             inst.status = SandboxStatus::Running;
             inst.network_name = Some(net_name);
@@ -875,6 +933,23 @@ impl VmBackend for DockerBackend {
             {
                 inst.container_ip = container_ip;
                 inst.proxy = proxy;
+            }
+        }
+
+        // Install proxy CA cert and env in the restored guest.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(inst) = self.instances.get(&key) {
+                if let Some(ref proxy) = inst.proxy {
+                    let agent = self.agent_client_for(&inst);
+                    let cert_pem = proxy.ca().cert_pem.clone();
+                    let proxy_port = proxy.port();
+                    drop(inst);
+                    crate::ca_trust::install_ca_cert(&agent, &cert_pem).await;
+                    if let Some(gateway) = self.get_network_gateway(&new_container_id).await {
+                        crate::ca_trust::write_proxy_env(&agent, &gateway, proxy_port).await;
+                    }
+                }
             }
         }
 

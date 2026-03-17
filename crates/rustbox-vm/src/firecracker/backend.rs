@@ -185,7 +185,7 @@ impl VmBackend for FirecrackerBackend {
 
         // Set up networking (Linux only).
         #[cfg(target_os = "linux")]
-        let (tap_name, nft_table) = {
+        let (tap_name, nft_table, proxy) = {
             use super::network;
             use rustbox_network::NftablesRuleSet;
 
@@ -241,6 +241,19 @@ impl VmBackend for FirecrackerBackend {
             #[cfg(target_os = "linux")]
             {
                 inst.proxy = proxy;
+            }
+        }
+
+        // Install proxy CA certificate in the guest if a proxy is running.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(inst) = self.instances.get(&key) {
+                if let Some(ref proxy) = inst.proxy {
+                    let agent = self.agent_client_for(&inst);
+                    let cert_pem = proxy.ca().cert_pem.clone();
+                    drop(inst);
+                    crate::ca_trust::install_ca_cert(&agent, &cert_pem).await;
+                }
             }
         }
 
@@ -491,6 +504,10 @@ impl VmBackend for FirecrackerBackend {
                         .await
                         .map_err(|e| RustboxError::VmBackend(format!("proxy redirect: {e}")))?;
                 }
+                // Install CA cert in the guest for the new proxy.
+                let agent = self.agent_client_for(&inst);
+                let cert_pem = proxy.ca().cert_pem.clone();
+                crate::ca_trust::install_ca_cert(&agent, &cert_pem).await;
                 inst.proxy = Some(proxy);
             } else if !needs_proxy && has_proxy {
                 // Stop the proxy.
