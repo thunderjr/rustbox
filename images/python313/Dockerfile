@@ -4,6 +4,7 @@ COPY . .
 RUN cargo build --release --bin rustbox-agent
 
 FROM python:3.13-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/rustbox-agent /usr/bin/rustbox-agent
 COPY scripts/vm-init.sh /sbin/init
 RUN chmod +x /sbin/init
