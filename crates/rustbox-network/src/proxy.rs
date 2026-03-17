@@ -186,19 +186,55 @@ async fn handle_connection(
     }
 }
 
+/// Maximum header size before returning 431 Request Header Fields Too Large.
+const MAX_HEADER_SIZE: usize = 65536;
+
+/// Read from `stream` until `\r\n\r\n` is found or `MAX_HEADER_SIZE` is exceeded.
+/// Returns the accumulated bytes (headers + any body bytes read so far).
+async fn read_until_headers_end(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Ok(buf);
+            }
+            // Connection closed before headers ended — return what we have
+            // and let the caller deal with the parse error.
+            return Ok(buf);
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > MAX_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request headers too large",
+            ));
+        }
+    }
+    Ok(buf)
+}
+
 /// Handle plain HTTP: parse Host header, evaluate policy, forward or deny.
 async fn handle_plain_http(
     mut stream: TcpStream,
     _peer: SocketAddr,
     evaluator: Arc<RwLock<NetworkPolicyEvaluator>>,
 ) -> io::Result<()> {
-    // Read the full request headers (up to 8KB).
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let request_data = &buf[..n];
+    // Read until we have the full headers (up to 64KB).
+    let buf = match read_until_headers_end(&mut stream).await {
+        Ok(b) if b.is_empty() => return Ok(()),
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            send_http_error(&mut stream, 431, "Request Header Fields Too Large").await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let request_data = &buf;
 
     // Parse headers to extract Host.
     let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -277,16 +313,20 @@ async fn handle_https_connect(
     evaluator: Arc<RwLock<NetworkPolicyEvaluator>>,
     ca: Arc<CertificateAuthority>,
 ) -> io::Result<()> {
-    // Read the CONNECT request line.
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
+    // Read the CONNECT request line and headers.
+    let buf = match read_until_headers_end(&mut stream).await {
+        Ok(b) if b.is_empty() => return Ok(()),
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+            send_http_error(&mut stream, 431, "Request Header Fields Too Large").await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
-    let _ = req.parse(&buf[..n]).map_err(|e| {
+    let _ = req.parse(&buf).map_err(|e| {
         io::Error::new(io::ErrorKind::InvalidData, format!("CONNECT parse: {e}"))
     })?;
 
@@ -353,15 +393,29 @@ async fn handle_https_connect(
             let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
             let mut tls_stream = tls_acceptor.accept(stream).await?;
 
-            // Read the actual HTTP request from the TLS stream.
-            let mut inner_buf = vec![0u8; 8192];
-            let inner_n = tls_stream.read(&mut inner_buf).await?;
-            if inner_n == 0 {
-                return Ok(());
+            // Read the actual HTTP request from the TLS stream (up to 64KB headers).
+            let mut inner_buf = Vec::with_capacity(8192);
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = tls_stream.read(&mut tmp).await?;
+                if n == 0 {
+                    if inner_buf.is_empty() {
+                        return Ok(());
+                    }
+                    break;
+                }
+                inner_buf.extend_from_slice(&tmp[..n]);
+                if inner_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if inner_buf.len() > MAX_HEADER_SIZE {
+                    // Can't easily send HTTP error over TLS stream, just close.
+                    return Ok(());
+                }
             }
 
             // Inject headers into the inner request.
-            let modified = inject_headers(&inner_buf[..inner_n], &rule.headers)?;
+            let modified = inject_headers(&inner_buf, &rule.headers)?;
 
             // Set up TLS to upstream. Since this is a MITM proxy, we use a
             // permissive verifier — the proxy itself is the trust boundary.
@@ -474,6 +528,7 @@ async fn send_http_error(
     let reason = match status {
         400 => "Bad Request",
         403 => "Forbidden",
+        431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
         _ => "Error",
     };
@@ -614,5 +669,218 @@ mod tests {
     fn no_proxy_for_default_policy() {
         let policy = NetworkPolicy::default();
         assert!(!needs_domain_proxy(&policy));
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_blocked_domain() {
+        use rustbox_core::network::{NetworkMode, NetworkPolicy};
+
+        let policy = NetworkPolicy {
+            mode: NetworkMode::DenyAll,
+            allow_domains: vec!["allowed.example.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        let ca = crate::tls_proxy::CertificateAuthority::generate().unwrap();
+        let proxy = TransparentProxy::start(policy, ca).await.unwrap();
+        let port = proxy.port();
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: blocked.example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 Forbidden, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_allows_permitted_domain() {
+        use rustbox_core::network::{NetworkMode, NetworkPolicy};
+
+        let policy = NetworkPolicy {
+            mode: NetworkMode::DenyAll,
+            allow_domains: vec!["allowed.example.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        let ca = crate::tls_proxy::CertificateAuthority::generate().unwrap();
+        let proxy = TransparentProxy::start(policy, ca).await.unwrap();
+        let port = proxy.port();
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        // Send request to allowed domain — proxy should try upstream and fail with 502
+        // since there's no actual server at allowed.example.com.
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: allowed.example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        // Should NOT be 403 — expect 502 (upstream unreachable) or connection behavior
+        assert!(
+            !response.starts_with("HTTP/1.1 403"),
+            "allowed domain should not be denied, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_injects_transform_headers() {
+        use rustbox_core::network::{NetworkPolicy, TransformRule};
+
+        // Start a mock upstream server.
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+
+        let mock_handle = tokio::spawn(async move {
+            let (mut stream, _) = mock_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap();
+            let received = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Send a minimal response so the proxy doesn't hang.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            received
+        });
+
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok123".to_string());
+        let policy = NetworkPolicy {
+            transform_rules: vec![TransformRule {
+                domain: "127.0.0.1".to_string(),
+                headers,
+            }],
+            ..NetworkPolicy::default()
+        };
+
+        let ca = crate::tls_proxy::CertificateAuthority::generate().unwrap();
+        let proxy = TransparentProxy::start(policy, ca).await.unwrap();
+        let proxy_port = proxy.port();
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap();
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            mock_addr.port()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        // Read the response from proxy (forwarded from mock).
+        let mut buf = vec![0u8; 4096];
+        let _ = stream.read(&mut buf).await.unwrap();
+
+        // Check what the mock upstream received.
+        let received = mock_handle.await.unwrap();
+        assert!(
+            received.contains("Authorization: Bearer tok123"),
+            "expected injected header in upstream request, got: {received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_handles_connect_deny() {
+        use rustbox_core::network::{NetworkMode, NetworkPolicy};
+
+        let policy = NetworkPolicy {
+            mode: NetworkMode::DenyAll,
+            allow_domains: vec![],
+            ..NetworkPolicy::default()
+        };
+        let ca = crate::tls_proxy::CertificateAuthority::generate().unwrap();
+        let proxy = TransparentProxy::start(policy, ca).await.unwrap();
+        let port = proxy.port();
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"CONNECT blocked.example.com:443 HTTP/1.1\r\nHost: blocked.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 for blocked CONNECT, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_policy_swaps_evaluator() {
+        use rustbox_core::network::{NetworkMode, NetworkPolicy};
+
+        // Use a non-resolving domain to avoid IP-level policy checks.
+        // Start with a policy that allows nxdomain.test.invalid.
+        let policy = NetworkPolicy {
+            mode: NetworkMode::DenyAll,
+            allow_domains: vec!["nxdomain.test.invalid".to_string()],
+            ..NetworkPolicy::default()
+        };
+        let ca = crate::tls_proxy::CertificateAuthority::generate().unwrap();
+        let proxy = TransparentProxy::start(policy, ca).await.unwrap();
+        let port = proxy.port();
+
+        // Verify nxdomain.test.invalid is allowed (should get 502 not 403,
+        // since domain is allowed but can't resolve).
+        {
+            let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: nxdomain.test.invalid\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let response = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                !response.starts_with("HTTP/1.1 403"),
+                "nxdomain.test.invalid should be allowed initially, got: {response}"
+            );
+        }
+
+        // Update policy to deny everything.
+        let new_policy = NetworkPolicy {
+            mode: NetworkMode::DenyAll,
+            allow_domains: vec![],
+            ..NetworkPolicy::default()
+        };
+        proxy.update_policy(new_policy).await;
+
+        // Small delay to let the policy swap propagate.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Now the domain should be denied.
+        {
+            let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: nxdomain.test.invalid\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            let response = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "nxdomain.test.invalid should be denied after policy update, got: {response}"
+            );
+        }
     }
 }
