@@ -30,7 +30,7 @@ rustbox-cli ──▶ rustbox-sdk ──▶ rustbox-daemon (:8080)
 | **rustbox-vm** | `VmBackend` implementations: `DockerBackend` (default, macOS + Linux), `FirecrackerBackend` (Linux + KVM), `LocalBackend` (no isolation, dev only), `MockBackend` (tests). Also has `AgentClient` for the TCP wire protocol |
 | **rustbox-agent** | Standalone binary that runs inside the container/VM. Receives commands over TCP, executes them, streams stdout/stderr back. Own copy of protocol types (wire-compatible, no `rustbox-core` dependency) |
 | **rustbox-storage** | `SnapshotStore` (SQLite/WAL via rusqlite), `OverlayConfig`, `BaseImageStore`, tar+zstd archival |
-| **rustbox-network** | Network policy evaluation, nftables rule generation, TLS MITM `CertificateAuthority` (rcgen), credential header injection. Linux-specific modules stubbed behind `#[cfg(target_os = "linux")]` |
+| **rustbox-network** | Network policy evaluation, nftables rule generation, transparent HTTP/HTTPS proxy with domain filtering, TLS MITM `CertificateAuthority` (rcgen), credential header injection. Linux-specific modules stubbed behind `#[cfg(target_os = "linux")]` |
 | **rustbox-daemon** | Axum REST API under `/v1`. `Orchestrator` owns `Arc<dyn VmBackend>` + `SnapshotStore`. Background tasks: `TimeoutWatchdog`, `SnapshotReaper` |
 | **rustbox-sdk** | `RustboxClient` wrapping reqwest. Typed responses for everything |
 | **rustbox-cli** | Clap-based CLI binary (`sandbox`). Subcommands: `create`, `list`, `stop`, `exec`, `copy`, `run`, `connect`, `snapshot` |
@@ -80,7 +80,7 @@ That's it. `make setup` builds three images (`rustbox-node24`, `rustbox-node22`,
 # Build everything
 cargo build --workspace
 
-# Run all 176 tests (MockBackend, no Docker needed)
+# Run all tests (MockBackend, no Docker needed)
 cargo test --workspace
 
 # Lint
@@ -199,6 +199,19 @@ Two modes: `AllowAll` (default) and `DenyAll`.
 ```
 
 `DenyAll` blocks everything except explicitly allowed domains/subnets. Transform rules inject headers for specific domains (credential brokering via TLS MITM proxy).
+
+### How It Works
+
+When domain-level rules are present (`allow_domains` in DenyAll mode, or `transform_rules`), rustbox starts a transparent HTTP/HTTPS proxy on the host:
+
+1. **Proxy starts** during sandbox `start()` — binds to a random port on localhost
+2. **CA certificate** is written to the guest and trusted via `update-ca-certificates`
+3. **Traffic redirect** routes HTTP/HTTPS through the proxy:
+   - Firecracker: iptables REDIRECT on the TAP interface
+   - Docker: `HTTP_PROXY`/`HTTPS_PROXY` env vars written to `/etc/profile.d/rustbox-proxy.sh`
+4. **Domain filtering** — the proxy evaluates each request against the policy, returning 403 for blocked domains
+5. **Header injection** — for `transform_rules` domains, the proxy performs TLS MITM to inject headers (e.g., auth tokens) into upstream requests
+6. **Runtime updates** — `PATCH /v1/sandboxes/:id/network-policy` hot-swaps the proxy's policy evaluator without restart
 
 ## Sandbox Config
 
