@@ -6,6 +6,7 @@ use rustbox_core::{
     CommandId, CommandOutput, CommandRequest, Result, RustboxError,
     SandboxConfig, SandboxId, SandboxMetrics, SandboxStatus, SnapshotId,
     backend::VmBackend,
+    network::NetworkPolicy,
 };
 
 /// A mock VM backend for testing that does not spawn real VMs.
@@ -24,6 +25,11 @@ impl MockBackend {
         Self {
             sandboxes: DashMap::new(),
         }
+    }
+
+    /// Retrieve the stored config for a sandbox (for testing).
+    pub fn get_config(&self, id: &SandboxId) -> Option<SandboxConfig> {
+        self.sandboxes.get(&id.to_string()).map(|s| s.config.clone())
     }
 }
 
@@ -136,6 +142,16 @@ impl VmBackend for MockBackend {
         if !self.sandboxes.contains_key(&key) {
             return Err(RustboxError::SandboxNotFound(key));
         }
+        Ok(())
+    }
+
+    async fn update_network_policy(&self, id: &SandboxId, policy: &NetworkPolicy) -> Result<()> {
+        let key = id.to_string();
+        let mut sandbox = self
+            .sandboxes
+            .get_mut(&key)
+            .ok_or_else(|| RustboxError::SandboxNotFound(key))?;
+        sandbox.config.network_policy = policy.clone();
         Ok(())
     }
 
@@ -285,6 +301,31 @@ mod tests {
 
         let snap_id = backend.snapshot_create(&id).await.unwrap();
         assert!(!snap_id.0.is_empty(), "SnapshotId should not be empty");
+    }
+
+    #[tokio::test]
+    async fn update_network_policy_stores_new_policy() {
+        let backend = MockBackend::new();
+        let id = SandboxId::new();
+        backend.create(&id, &test_config()).await.unwrap();
+        backend.start(&id).await.unwrap();
+
+        let new_policy = NetworkPolicy {
+            mode: rustbox_core::network::NetworkMode::DenyAll,
+            allow_domains: vec!["example.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        backend
+            .update_network_policy(&id, &new_policy)
+            .await
+            .unwrap();
+
+        let config = backend.get_config(&id).unwrap();
+        assert!(matches!(
+            config.network_policy.mode,
+            rustbox_core::network::NetworkMode::DenyAll
+        ));
+        assert_eq!(config.network_policy.allow_domains, vec!["example.com"]);
     }
 
     #[tokio::test]

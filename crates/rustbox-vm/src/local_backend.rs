@@ -10,7 +10,9 @@ use tokio::sync::{mpsc, Mutex};
 use rustbox_core::{
     backend::VmBackend, CommandId, CommandOutput, CommandRequest, Result, RustboxError, SandboxConfig,
     SandboxId, SandboxMetrics, SandboxStatus, SnapshotId,
+    network::NetworkPolicy,
 };
+use tracing::warn;
 
 const SANDBOX_BASE_DIR: &str = "/tmp/rustbox-sandboxes";
 
@@ -285,6 +287,17 @@ impl VmBackend for LocalBackend {
         tokio::fs::create_dir_all(&full_path)
             .await
             .map_err(|e| RustboxError::VmBackend(format!("failed to create directory: {e}")))?;
+        Ok(())
+    }
+
+    async fn update_network_policy(&self, id: &SandboxId, policy: &NetworkPolicy) -> Result<()> {
+        let key = id.to_string();
+        let mut sandbox = self
+            .sandboxes
+            .get_mut(&key)
+            .ok_or_else(|| RustboxError::SandboxNotFound(key))?;
+        warn!("network policy enforcement unavailable in LocalBackend");
+        sandbox.config.network_policy = policy.clone();
         Ok(())
     }
 

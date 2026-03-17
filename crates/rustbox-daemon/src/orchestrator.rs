@@ -106,7 +106,19 @@ impl Orchestrator {
             .get_mut(id)
             .ok_or_else(|| RustboxError::SandboxNotFound(id.to_string()))?;
         entry.sandbox.config.network_policy = policy;
-        Ok(entry.sandbox.clone())
+
+        let sid = SandboxId(id.to_string());
+        // Drop the mutable borrow before the async call to avoid holding it
+        // across an await point.
+        let updated_policy = entry.sandbox.config.network_policy.clone();
+        let sandbox = entry.sandbox.clone();
+        drop(entry);
+
+        self.backend
+            .update_network_policy(&sid, &updated_policy)
+            .await?;
+
+        Ok(sandbox)
     }
 
     pub async fn exec_command(&self, sandbox_id: &str, cmd: CommandRequest) -> Result<String> {
@@ -371,6 +383,35 @@ mod tests {
             rustbox_core::network::NetworkMode::DenyAll => {}
             _ => panic!("expected DenyAll"),
         }
+    }
+
+    #[tokio::test]
+    async fn update_network_policy_propagates_to_backend() {
+        let backend = Arc::new(MockBackend::new());
+        let snapshot_store = SnapshotStore::new_in_memory().unwrap();
+        let orch = Orchestrator::new(backend.clone(), snapshot_store);
+
+        let sandbox = orch.create_sandbox(test_config()).await.unwrap();
+        let id = sandbox.id.to_string();
+
+        let policy = NetworkPolicy {
+            mode: rustbox_core::network::NetworkMode::DenyAll,
+            allow_domains: vec!["*.github.com".to_string()],
+            ..NetworkPolicy::default()
+        };
+        orch.update_network_policy(&id, policy).await.unwrap();
+
+        // Verify the MockBackend stored the updated policy.
+        let sid = rustbox_core::SandboxId(id);
+        let config = backend.get_config(&sid).unwrap();
+        assert!(matches!(
+            config.network_policy.mode,
+            rustbox_core::network::NetworkMode::DenyAll
+        ));
+        assert_eq!(
+            config.network_policy.allow_domains,
+            vec!["*.github.com"]
+        );
     }
 
     #[tokio::test]

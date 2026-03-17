@@ -5,6 +5,7 @@ use crate::command::{CommandOutput, CommandRequest};
 use crate::error::Result;
 use crate::id::{CommandId, SandboxId, SnapshotId};
 use crate::metrics::SandboxMetrics;
+use crate::network::NetworkPolicy;
 use crate::sandbox::{SandboxConfig, SandboxStatus};
 
 #[async_trait]
@@ -27,6 +28,7 @@ pub trait VmBackend: Send + Sync {
     async fn write_file(&self, id: &SandboxId, path: &str, content: &[u8]) -> Result<()>;
     async fn read_file(&self, id: &SandboxId, path: &str) -> Result<Vec<u8>>;
     async fn mkdir(&self, id: &SandboxId, path: &str) -> Result<()>;
+    async fn update_network_policy(&self, id: &SandboxId, policy: &NetworkPolicy) -> Result<()>;
     async fn snapshot_create(&self, id: &SandboxId) -> Result<SnapshotId>;
     async fn snapshot_restore(&self, id: &SandboxId, snap: &SnapshotId) -> Result<()>;
     async fn metrics(&self, id: &SandboxId) -> Result<SandboxMetrics>;
