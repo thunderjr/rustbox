@@ -333,3 +333,45 @@ async fn test_metrics_endpoint() {
     assert_eq!(body["cpu_usage_percent"], 0.0);
     assert_eq!(body["memory_used_bytes"], 0);
 }
+
+#[tokio::test]
+async fn test_update_network_policy_nonexistent_sandbox() {
+    let app = build_test_app();
+    let (status, body) = json_request(
+        app,
+        "PATCH",
+        "/v1/sandboxes/nonexistent-id/network-policy",
+        Some(json!({
+            "network_policy": {
+                "mode": "deny_all",
+                "allow_domains": [],
+                "subnets_allow": [],
+                "subnets_deny": [],
+                "transform_rules": []
+            }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn test_update_network_policy_invalid_body() {
+    let app = build_test_app();
+    let (_, created) = create_sandbox(app.clone()).await;
+    let id = created["id"].as_str().unwrap();
+
+    let (status, _) = json_request(
+        app,
+        "PATCH",
+        &format!("/v1/sandboxes/{id}/network-policy"),
+        Some(json!({})),
+    )
+    .await;
+    // Missing `network_policy` field should return 422 or 400
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "expected 422 or 400, got {status}"
+    );
+}
