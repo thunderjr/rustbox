@@ -40,6 +40,10 @@ struct VmInstance {
     vsock_path: PathBuf,
     /// Guest CID assigned to this VM.
     guest_cid: u32,
+    /// TAP device name (Linux only).
+    tap_name: Option<String>,
+    /// Per-sandbox nftables table name (Linux only).
+    nft_table: Option<String>,
 }
 
 /// The Firecracker `VmBackend` implementation.
@@ -84,8 +88,7 @@ impl FirecrackerBackend {
 
     /// Connect to the guest agent for a given sandbox.
     fn agent_client_for(&self, instance: &VmInstance) -> AgentClient {
-        // For now, use TCP on port 5123 as fallback until vsock is wired up.
-        AgentClient::new_tcp("127.0.0.1".to_string(), 5123 + instance.guest_cid as u16)
+        AgentClient::new_vsock(instance.vsock_path.clone(), 5123)
     }
 }
 
@@ -105,6 +108,8 @@ impl VmBackend for FirecrackerBackend {
             socket_path,
             vsock_path,
             guest_cid: cid,
+            tap_name: None,
+            nft_table: None,
         };
 
         self.instances.insert(id.to_string(), instance);
@@ -172,6 +177,28 @@ impl VmBackend for FirecrackerBackend {
 
         client.put_machine_config(vcpu_count, mem_size_mib).await?;
 
+        // Set up networking (Linux only).
+        #[cfg(target_os = "linux")]
+        let (tap_name, nft_table) = {
+            use super::network;
+            use rustbox_network::NftablesRuleSet;
+
+            let tap_name = format!("rb{guest_cid}");
+            network::create_tap(&tap_name)?;
+            let mac = network::generate_mac(id);
+            client
+                .put_network_interface("eth0", &tap_name, &mac)
+                .await?;
+
+            let ruleset = NftablesRuleSet::from_policy(&sandbox_config.network_policy);
+            let nft_table = format!("rustbox_{}", &id.to_string()[..8]);
+            network::apply_nftables(&nft_table, &ruleset).await?;
+
+            (Some(tap_name), Some(nft_table))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (tap_name, nft_table): (Option<String>, Option<String>) = (None, None);
+
         client
             .put_vsock(
                 vsock_path.to_str().unwrap_or("vsock.sock"),
@@ -185,6 +212,8 @@ impl VmBackend for FirecrackerBackend {
         if let Some(mut inst) = self.instances.get_mut(&key) {
             inst.process = Some(process);
             inst.status = SandboxStatus::Running;
+            inst.tap_name = tap_name;
+            inst.nft_table = nft_table;
         }
 
         info!(%id, "sandbox started");
@@ -219,6 +248,18 @@ impl VmBackend for FirecrackerBackend {
                 proc.kill().await?;
             }
             inst.process = None;
+
+            // Clean up networking resources (Linux only).
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(ref table) = inst.nft_table {
+                    let _ = super::network::remove_nftables(table).await;
+                }
+                if let Some(ref tap) = inst.tap_name {
+                    let _ = super::network::delete_tap(tap);
+                }
+            }
+
             inst.status = SandboxStatus::Stopped;
         }
 

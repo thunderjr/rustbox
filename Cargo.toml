@@ -66,6 +66,7 @@ rcgen = "0.13"
 
 # Linux syscalls
 nix = { version = "0.29", features = ["mount", "sched", "socket", "net", "ioctl", "process", "signal"] }
+libc = "0.2"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
