@@ -9,6 +9,7 @@ use rustbox_core::{
     CommandId, CommandOutput, CommandRequest, Result, RustboxError,
     SandboxConfig, SandboxId, SandboxMetrics, SandboxStatus, SnapshotId,
     backend::VmBackend,
+    network::NetworkPolicy,
     protocol::AgentRequest,
 };
 
@@ -44,6 +45,9 @@ struct VmInstance {
     tap_name: Option<String>,
     /// Per-sandbox nftables table name (Linux only).
     nft_table: Option<String>,
+    /// Transparent proxy for domain-level filtering (Linux only).
+    #[cfg(target_os = "linux")]
+    proxy: Option<rustbox_network::TransparentProxy>,
 }
 
 /// The Firecracker `VmBackend` implementation.
@@ -110,6 +114,8 @@ impl VmBackend for FirecrackerBackend {
             guest_cid: cid,
             tap_name: None,
             nft_table: None,
+            #[cfg(target_os = "linux")]
+            proxy: None,
         };
 
         self.instances.insert(id.to_string(), instance);
@@ -194,7 +200,25 @@ impl VmBackend for FirecrackerBackend {
             let nft_table = format!("rustbox_{}", &id.to_string()[..8]);
             network::apply_nftables(&nft_table, &ruleset).await?;
 
-            (Some(tap_name), Some(nft_table))
+            // Start transparent proxy if domain-level rules exist.
+            let proxy = if rustbox_network::needs_domain_proxy(&sandbox_config.network_policy) {
+                let ca = rustbox_network::CertificateAuthority::generate()
+                    .map_err(|e| RustboxError::VmBackend(format!("generate CA: {e}")))?;
+                let proxy = rustbox_network::TransparentProxy::start(
+                    sandbox_config.network_policy.clone(),
+                    ca,
+                )
+                .await
+                .map_err(|e| RustboxError::VmBackend(format!("start proxy: {e}")))?;
+                rustbox_network::proxy_redirect::setup_redirect(&tap_name, proxy.port())
+                    .await
+                    .map_err(|e| RustboxError::VmBackend(format!("proxy redirect: {e}")))?;
+                Some(proxy)
+            } else {
+                None
+            };
+
+            (Some(tap_name), Some(nft_table), proxy)
         };
         #[cfg(not(target_os = "linux"))]
         let (tap_name, nft_table): (Option<String>, Option<String>) = (None, None);
@@ -214,6 +238,10 @@ impl VmBackend for FirecrackerBackend {
             inst.status = SandboxStatus::Running;
             inst.tap_name = tap_name;
             inst.nft_table = nft_table;
+            #[cfg(target_os = "linux")]
+            {
+                inst.proxy = proxy;
+            }
         }
 
         info!(%id, "sandbox started");
@@ -252,6 +280,13 @@ impl VmBackend for FirecrackerBackend {
             // Clean up networking resources (Linux only).
             #[cfg(target_os = "linux")]
             {
+                // Stop proxy and remove redirect rules before tearing down network.
+                if let Some(proxy) = inst.proxy.take() {
+                    if let Some(ref tap) = inst.tap_name {
+                        let _ = rustbox_network::proxy_redirect::remove_redirect(tap).await;
+                    }
+                    proxy.stop();
+                }
                 if let Some(ref table) = inst.nft_table {
                     let _ = super::network::remove_nftables(table).await;
                 }
@@ -417,6 +452,62 @@ impl VmBackend for FirecrackerBackend {
         let mut conn = agent.connect().await?;
         conn.send_request(&request).await?;
         let _resp = conn.recv_response().await?;
+        Ok(())
+    }
+
+    async fn update_network_policy(&self, id: &SandboxId, policy: &NetworkPolicy) -> Result<()> {
+        let key = id.to_string();
+        let mut inst = self
+            .instances
+            .get_mut(&key)
+            .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            use rustbox_network::NftablesRuleSet;
+            if let Some(ref table) = inst.nft_table {
+                let _ = super::network::remove_nftables(table).await;
+                let ruleset = NftablesRuleSet::from_policy(policy);
+                super::network::apply_nftables(table, &ruleset).await?;
+            }
+
+            let needs_proxy = rustbox_network::needs_domain_proxy(policy);
+            let has_proxy = inst.proxy.is_some();
+
+            if needs_proxy && has_proxy {
+                // Update existing proxy policy.
+                if let Some(ref proxy) = inst.proxy {
+                    proxy.update_policy(policy.clone()).await;
+                }
+            } else if needs_proxy && !has_proxy {
+                // Start a new proxy.
+                let ca = rustbox_network::CertificateAuthority::generate()
+                    .map_err(|e| RustboxError::VmBackend(format!("generate CA: {e}")))?;
+                let proxy = rustbox_network::TransparentProxy::start(policy.clone(), ca)
+                    .await
+                    .map_err(|e| RustboxError::VmBackend(format!("start proxy: {e}")))?;
+                if let Some(ref tap) = inst.tap_name {
+                    rustbox_network::proxy_redirect::setup_redirect(tap, proxy.port())
+                        .await
+                        .map_err(|e| RustboxError::VmBackend(format!("proxy redirect: {e}")))?;
+                }
+                inst.proxy = Some(proxy);
+            } else if !needs_proxy && has_proxy {
+                // Stop the proxy.
+                if let Some(proxy) = inst.proxy.take() {
+                    if let Some(ref tap) = inst.tap_name {
+                        let _ = rustbox_network::proxy_redirect::remove_redirect(tap).await;
+                    }
+                    proxy.stop();
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            warn!("network policy enforcement unavailable on this platform");
+        }
+
+        inst.config.network_policy = policy.clone();
         Ok(())
     }
 

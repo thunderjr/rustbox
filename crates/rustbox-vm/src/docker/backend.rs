@@ -58,6 +58,9 @@ struct DockerInstance {
     network_name: Option<String>,
     #[cfg(target_os = "linux")]
     container_ip: Option<String>,
+    /// Transparent proxy for domain-level filtering (Linux only).
+    #[cfg(target_os = "linux")]
+    proxy: Option<rustbox_network::TransparentProxy>,
 }
 
 /// VmBackend implementation backed by Docker containers.
@@ -289,7 +292,7 @@ impl VmBackend for DockerBackend {
         // Create a per-sandbox bridge network so agent port mapping works
         // even with DenyAll policy. Egress filtering is handled via iptables
         // on Linux (applied in start()).
-        let net_name = network::create_sandbox_network(&self.docker, id).await?;
+        let net_name = network::create_sandbox_network(&self.docker, id, &config.network_policy).await?;
 
         let mut labels = HashMap::new();
         labels.insert(MANAGED_LABEL.to_string(), "true".to_string());
@@ -334,6 +337,8 @@ impl VmBackend for DockerBackend {
                 network_name: Some(net_name),
                 #[cfg(target_os = "linux")]
                 container_ip: None,
+                #[cfg(target_os = "linux")]
+                proxy: None,
             },
         );
 
@@ -364,19 +369,47 @@ impl VmBackend for DockerBackend {
         // Wait for the agent to be ready.
         Self::wait_for_agent("127.0.0.1", host_port, 30).await?;
 
-        // Apply iptables rules for network policy enforcement on Linux.
-        #[cfg(target_os = "linux")]
+        // Apply iptables rules for network policy enforcement.
+        // On Linux this enforces subnet-level filtering; on macOS the stubs log a warning.
         {
             let inst = self
                 .instances
                 .get(&key)
                 .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
-            if let Some(ref net) = inst.network_name {
-                let ip = self.get_container_ip(&container_id, net).await?;
-                network::apply_iptables(&ip, &inst.config.network_policy).await?;
-                drop(inst);
-                if let Some(mut inst) = self.instances.get_mut(&key) {
-                    inst.container_ip = Some(ip);
+            let policy = inst.config.network_policy.clone();
+            let net = inst.network_name.clone();
+            drop(inst);
+
+            if net.is_some() {
+                #[cfg(target_os = "linux")]
+                {
+                    let net_name = net.as_ref().unwrap();
+                    let ip = self.get_container_ip(&container_id, net_name).await?;
+                    network::apply_iptables(&ip, &policy).await?;
+
+                    // Start transparent proxy if domain-level rules exist.
+                    let proxy = if rustbox_network::needs_domain_proxy(&policy) {
+                        let ca = rustbox_network::CertificateAuthority::generate()
+                            .map_err(|e| RustboxError::VmBackend(format!("generate CA: {e}")))?;
+                        let proxy = rustbox_network::TransparentProxy::start(policy.clone(), ca)
+                            .await
+                            .map_err(|e| RustboxError::VmBackend(format!("start proxy: {e}")))?;
+                        // Note: Docker uses port mapping, not TAP interfaces. Proxy redirect
+                        // for Docker would need container-level iptables, which is handled
+                        // separately from the Firecracker TAP approach.
+                        Some(proxy)
+                    } else {
+                        None
+                    };
+
+                    if let Some(mut inst) = self.instances.get_mut(&key) {
+                        inst.container_ip = Some(ip);
+                        inst.proxy = proxy;
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    network::apply_iptables("", &policy).await?;
                 }
             }
         }
@@ -408,12 +441,27 @@ impl VmBackend for DockerBackend {
 
         info!(%id, "stopping docker sandbox");
 
+        // Stop proxy before tearing down networking.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(mut inst) = self.instances.get_mut(&key) {
+                if let Some(proxy) = inst.proxy.take() {
+                    proxy.stop();
+                }
+            }
+        }
+
         // Clean up iptables rules before stopping the container.
+        // On macOS the stub logs a warning and returns Ok.
         #[cfg(target_os = "linux")]
         {
             if let Some(ref ip) = container_ip {
                 let _ = network::remove_iptables(ip).await;
             }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = network::remove_iptables("").await;
         }
 
         let stop_opts = StopContainerOptions { t: 10 };
@@ -449,6 +497,49 @@ impl VmBackend for DockerBackend {
             .get(&key)
             .ok_or_else(|| RustboxError::SandboxNotFound(key))?;
         Ok(inst.status.clone())
+    }
+
+    async fn update_network_policy(&self, id: &SandboxId, policy: &rustbox_core::network::NetworkPolicy) -> Result<()> {
+        let key = id.to_string();
+        let mut inst = self
+            .instances
+            .get_mut(&key)
+            .ok_or_else(|| RustboxError::SandboxNotFound(key.clone()))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(ref ip) = inst.container_ip {
+                let _ = network::remove_iptables(ip).await;
+                network::apply_iptables(ip, policy).await?;
+            }
+
+            let needs_proxy = rustbox_network::needs_domain_proxy(policy);
+            let has_proxy = inst.proxy.is_some();
+
+            if needs_proxy && has_proxy {
+                if let Some(ref proxy) = inst.proxy {
+                    proxy.update_policy(policy.clone()).await;
+                }
+            } else if needs_proxy && !has_proxy {
+                let ca = rustbox_network::CertificateAuthority::generate()
+                    .map_err(|e| RustboxError::VmBackend(format!("generate CA: {e}")))?;
+                let proxy = rustbox_network::TransparentProxy::start(policy.clone(), ca)
+                    .await
+                    .map_err(|e| RustboxError::VmBackend(format!("start proxy: {e}")))?;
+                inst.proxy = Some(proxy);
+            } else if !needs_proxy && has_proxy {
+                if let Some(proxy) = inst.proxy.take() {
+                    proxy.stop();
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            network::apply_iptables("", policy).await?;
+        }
+
+        inst.config.network_policy = policy.clone();
+        Ok(())
     }
 
     async fn exec(
@@ -652,6 +743,10 @@ impl VmBackend for DockerBackend {
                 let _ = network::remove_iptables(ip).await;
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = network::remove_iptables("").await;
+        }
 
         // Stop and remove old container.
         let stop_opts = StopContainerOptions { t: 5 };
@@ -666,7 +761,7 @@ impl VmBackend for DockerBackend {
         if old_net_name.is_some() {
             let _ = network::remove_sandbox_network(&self.docker, id).await;
         }
-        let net_name = network::create_sandbox_network(&self.docker, id).await?;
+        let net_name = network::create_sandbox_network(&self.docker, id, &original_config.network_policy).await?;
 
         // Create new container from snapshot image.
         let snapshot_image = format!("rustbox-snap-{key}:{snap}");
@@ -744,13 +839,32 @@ impl VmBackend for DockerBackend {
         let host_port = self.get_mapped_port(&new_container_id).await?;
         Self::wait_for_agent("127.0.0.1", host_port, 30).await?;
 
-        // Apply iptables rules on Linux.
+        // Apply iptables rules.
         #[cfg(target_os = "linux")]
-        let container_ip = {
+        let (container_ip, proxy) = {
             let ip = self.get_container_ip(&new_container_id, &net_name).await?;
             network::apply_iptables(&ip, &original_config.network_policy).await?;
-            Some(ip)
+
+            let proxy = if rustbox_network::needs_domain_proxy(&original_config.network_policy) {
+                let ca = rustbox_network::CertificateAuthority::generate()
+                    .map_err(|e| RustboxError::VmBackend(format!("generate CA: {e}")))?;
+                let p = rustbox_network::TransparentProxy::start(
+                    original_config.network_policy.clone(),
+                    ca,
+                )
+                .await
+                .map_err(|e| RustboxError::VmBackend(format!("start proxy: {e}")))?;
+                Some(p)
+            } else {
+                None
+            };
+
+            (Some(ip), proxy)
         };
+        #[cfg(not(target_os = "linux"))]
+        {
+            network::apply_iptables("", &original_config.network_policy).await?;
+        }
 
         if let Some(mut inst) = self.instances.get_mut(&key) {
             inst.container_id = new_container_id;
@@ -760,6 +874,7 @@ impl VmBackend for DockerBackend {
             #[cfg(target_os = "linux")]
             {
                 inst.container_ip = container_ip;
+                inst.proxy = proxy;
             }
         }
 
